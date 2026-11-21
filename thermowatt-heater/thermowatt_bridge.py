@@ -129,6 +129,8 @@ class MyThermowattBridge:
         self._availability_state = {}
         self._unavailable_since = {}
         self._device_error_state = {}
+        # Every heater needs a fresh read after startup or a cloud pause before writes.
+        self._recovery_pending = set(self.config.get("devices", {}))
         self.mqtt_client.will_set("thermowatt/bridge/availability", "offline", retain=True)
         self.mqtt_client.on_connect = self.on_connect
 
@@ -230,6 +232,12 @@ class MyThermowattBridge:
 
     def _send_request(self, method, endpoint, serial=None, auth=False, **kwargs):
         """Log each HTTP attempt, including auth retries, without request/response bodies."""
+        # Enforce this at the transport boundary, including authentication and retries.
+        if time.time() < self.config.get("blocked_until", 0):
+            raise RuntimeError("Cloud requests paused after rate limiting")
+        if not auth and method.upper() not in {"GET", "HEAD"} and (
+                serial in self._recovery_pending or (serial is None and self._recovery_pending)):
+            raise RuntimeError("Heater commands require a fresh valid status after a cloud pause")
         started = time.monotonic()
         status = "none"
         reason = "transport error"
@@ -258,6 +266,7 @@ class MyThermowattBridge:
         if until >= self.config.get("blocked_until", 0):
             self.config["blocked_until"] = until
             self.config["cooldown_reason"] = reason
+        self._recovery_pending.update(self.config.get("devices", {}))
         self._save_config()
         for serial in self.config.get("devices", {}):
             self.availability(serial, False)
@@ -319,30 +328,45 @@ class MyThermowattBridge:
                         max(0, int(until-current)))
             self.last_pause_log = current
 
-    def _validate(self, response):
+    def _validate(self, response, allow_unauthorized=False):
         try:
             body = response.json()
         except ValueError:
             body = None
         error = str(body.get("error", "")) if isinstance(body, dict) else ""
         daily = "daily" in error.lower() and "limit" in error.lower()
-        limited = response.status_code == 429 or "limit exceeded" in error.lower()
+        limited = response.status_code == 429 or daily or "limit exceeded" in error.lower()
         if limited:
             self.retry_attempt += 1
-            delay = 86400 if daily else min(3600, self.POLL_INTERVAL * 2 ** min(self.retry_attempt, 6))
+            if daily:
+                # Vendor reset time is unknown. Avoid assuming a full 24-hour lockout.
+                strikes = min(6, max(0, int(self.config.get("daily_limit_strikes", 0))) + 1)
+                self.config["daily_limit_strikes"] = strikes
+                delay = min(86400, 3600 * (2 ** (strikes - 1)))
+                LOGGER.warning("[RATE LIMIT] Daily quota reached; attempt=%s; cooldown=%ss",
+                               strikes, delay)
+            else:
+                delay = min(3600, self.POLL_INTERVAL * 2 ** min(self.retry_attempt, 6))
             retry_after = response.headers.get("Retry-After")
             if retry_after:
                 try:
-                    delay = max(delay, float(retry_after))
-                except ValueError:
                     try:
-                        delay = max(delay, parsedate_to_datetime(retry_after).timestamp() - time.time())
-                    except (ValueError, TypeError, OverflowError):
-                        pass
+                        retry_delay = float(retry_after)
+                    except ValueError:
+                        retry_delay = parsedate_to_datetime(retry_after).timestamp() - time.time()
+                    # Invalid headers must not persist an infinite/unrenderable deadline.
+                    datetime.datetime.fromtimestamp(time.time() + retry_delay, datetime.timezone.utc)
+                    if math.isfinite(retry_delay):
+                        delay = max(delay, retry_delay)
+                except (ValueError, TypeError, OverflowError, OSError):
+                    pass
             self._pause(delay, "daily_request_limit" if daily else "cloud_rate_limit")
             raise RuntimeError(f"Cloud request limit reached; paused for {delay:.0f}s")
+        if allow_unauthorized and response.status_code == 401:
+            return body
         response.raise_for_status()
-        if not isinstance(body, dict) or body.get("success") is False:
+        if (not isinstance(body, dict) or body.get("success", True) is not True
+                or body.get("error")):
             raise ValueError("Cloud returned an unsuccessful or malformed response")
         return body
 
@@ -355,11 +379,14 @@ class MyThermowattBridge:
             self.session.headers["seriale"] = serial
         kwargs.setdefault("timeout", (10, 30))
         response = self._send_request(method, endpoint, serial=serial, **kwargs)
-        if response.status_code == 401 and self.refresh_session():
-            self._reset_headers()
-            if serial:
-                self.session.headers["seriale"] = serial
-            response = self._send_request(method, endpoint, serial=serial, **kwargs)
+        if response.status_code == 401:
+            # A quota error takes precedence over authentication, even on HTTP 401.
+            self._validate(response, allow_unauthorized=True)
+            if self.refresh_session():
+                self._reset_headers()
+                if serial:
+                    self.session.headers["seriale"] = serial
+                response = self._send_request(method, endpoint, serial=serial, **kwargs)
         self._validate(response)
         return response
 
@@ -612,6 +639,9 @@ class MyThermowattBridge:
             if time.time() < self.config.get("blocked_until", 0):
                 LOGGER.warning("[CMD] %s: rejected while cloud requests are paused", self._device_label(serial))
                 return
+            if serial in self._recovery_pending:
+                LOGGER.warning("[CMD] %s: rejected until fresh status is received", self._device_label(serial))
+                return
             self.commands.put_nowait((serial, command, msg.payload.decode()))
         except (UnicodeDecodeError, queue.Full):
             LOGGER.warning("[CMD] Invalid payload or command queue full")
@@ -654,6 +684,10 @@ class MyThermowattBridge:
             for key in ("T_Avg", "T_SetPoint", "Cmd", "WaterHeaterSts"):
                 if isinstance(result.get(key), bool) or not math.isfinite(float(result[key])):
                     raise ValueError(f"Invalid {key}")
+            for key in ("Cmd", "WaterHeaterSts"):
+                value = float(result[key])
+                if not value.is_integer() or value < 0:
+                    raise ValueError(f"Invalid {key}")
             result["heating"] = bool(int(result["WaterHeaterSts"]) & 1)
             result["anti_legionella_active"] = bool(int(result["WaterHeaterSts"]) & 0x08)
             result.update(device_error_diagnostics(result))
@@ -670,10 +704,17 @@ class MyThermowattBridge:
                                    error_state[1], error_state[2], result['device_error_mapping'])
                 elif previous is not None and previous[0] != 'ok':
                     LOGGER.info('[DEVICE] %s: device error flags cleared', self._device_label(serial))
+
+            if self.config.get("daily_limit_strikes", 0):
+                LOGGER.info("[RATE LIMIT] Valid heater status; resetting recovery backoff")
+                self.config["daily_limit_strikes"] = 0
+                self.config["blocked_until"] = 0
+                self.config["cooldown_reason"] = "none"
             result["last_successful_update"] = datetime.datetime.now(datetime.timezone.utc).isoformat()
             self.config["devices"][serial]["last_setpoint"] = int(float(result["T_SetPoint"]))
             self._save_config()
             self.mqtt_client.publish(f"P/{serial}/STATUS", json.dumps(status), retain=True)
+            self._recovery_pending.discard(serial)
             self.availability(serial, True)
             return True
         except Exception as exc:
@@ -770,6 +811,7 @@ class MyThermowattBridge:
                             active[serial] = self.config["devices"].get(serial, {})
                             active[serial]["name"] = item.get("nome", "Boiler")
                         self.config["devices"] = active
+                        self._recovery_pending = set(active)
                         self._save_config()
                         for serial, device in active.items():
                             self.publish_discovery(serial, device["name"])

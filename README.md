@@ -1,33 +1,138 @@
 # Thermowatt Smart Boiler Bridge for Home Assistant
 
-This fork includes a reliability repair in version 1.3.1. See [repair details,
-installation, validation and rollback](REPAIR.md) before switching an existing system.
+This fork includes progressive rate-limit recovery in version 1.3.7, described
+below. See the [original repair guide](REPAIR.md) for backup, validation and
+rollback guidance; its older release instructions describe historical behaviour.
 
-This add-on allows you to integrate Thermowatt-based smart water heaters into Home Assistant using MQTT. It bridges the gap between the Thermowatt cloud and your local Home Assistant instance.
+This add-on allows you to integrate Thermowatt-based smart water heaters into Home Assistant using MQTT. It bridges the gap between the Thermowatt cloud and your local Home Assistant instance. Readings and heater commands require the vendor cloud; this is not local heater control.
 
-[![Open your Home Assistant instance and show the add add-on repository dialog with a specific repository URL pre-filled.](https://my.home-assistant.io/badges/supervisor_add_addon_repository.svg)](https://my.home-assistant.io/redirect/supervisor_add_addon_repository/?repository_url=https%3A%2F%2Fgithub.com%2Fwaterheater-dev%2Fha-thermowatt-heater)
+[![Open your Home Assistant instance and show the add add-on repository dialog with a specific repository URL pre-filled.](https://my.home-assistant.io/badges/supervisor_add_addon_repository.svg)](https://my.home-assistant.io/redirect/supervisor_add_addon_repository/?repository_url=https%3A%2F%2Fgithub.com%2Fskooterpunk%2Fha-thermowatt-heater)
 
 ## Features
 
-- **Real-time Monitoring**: Track current water temperature (`T_Avg`).
-- **Full Control**: Set target temperatures and toggle between Manual/Auto modes.
+- **Polled Monitoring**: Track cloud-reported water temperature (`T_Avg`).
+- **Cloud Commands**: Set target temperatures and change operating mode when cloud access and the recovery checks allow it.
 - **MQTT Discovery**: Automatically creates a "Water Heater" device in Home Assistant.
 - **Diagnostic Sensors**: Monitor errors and system status.
 
 ## Installation
 
 1. Prerequisite: Install and start Mosquitto MQTT broker within Home Assistant.
-2. Click the **Add Repository** button above, or manually add `https://github.com/waterheater-dev/ha-thermowatt-heater` to your Home Assistant Add-on Store.
+2. Click the **Add Repository** button above, or manually add `https://github.com/skooterpunk/ha-thermowatt-heater` to your Home Assistant Add-on Store.
 3. Install the **Thermowatt Smart Boiler** add-on.
 4. Configure your Thermowatt account credentials in the **Configuration** tab.
 5. Start the add-on.
+
+When switching an existing installation, back up the app and its data first and
+confirm that Home Assistant offers this fork's version 1.3.7. Stop the old bridge
+before starting the fork; do not run multiple bridges against the same account.
 
 ## Configuration
 
 ```yaml
 email: "your-email@example.com"
 password: "your-password"
+poll_interval: 300
 ```
+
+`poll_interval` is the regular status polling interval in seconds for each heater:
+default **300** (5 minutes), allowed **60–3600**. Set it in the add-on's
+Configuration tab. Recovery preserves this setting; it does not switch to faster
+polling. Ordinary failed status reads are retried on the regular schedule unless
+a rate-limit response starts a cooldown.
+
+Scheduled status traffic is approximately `device_count * 86400 / poll_interval`
+requests per day, plus authentication, discovery and command-related requests.
+Accepted commands schedule a real status read after about 20 seconds. A longer
+interval reduces regular traffic but delays readings and some recovery attempts;
+neither the default nor any other interval is a known quota-safe setting.
+
+## Rate-limit recovery (v1.3.7)
+
+The bridge recognizes daily-limit errors in the cloud response body, including
+HTTP 200 responses, as well as HTTP 429 and other recognized limit-exceeded
+errors. A quota error takes precedence over an HTTP 401: the bridge pauses rather
+than refreshing authentication and replaying the request. A limit reported during
+token refresh also prevents replay of the original request.
+
+For successive daily-limit responses without an intervening valid heater status,
+the bridge chooses these waits, measured from each new limit response:
+
+| Daily-limit strike | Bridge cooldown |
+| --- | --- |
+| 1 | 1 hour |
+| 2 | 2 hours |
+| 3 | 4 hours |
+| 4 | 8 hours |
+| 5 | 16 hours |
+| 6 and later | 24 hours |
+
+Other recognized rate-limit responses use an increasing delay based on
+`poll_interval` (starting at twice that interval, capped at 1 hour). This retry
+counter is in memory; the daily-limit strike count is persisted. A valid longer
+`Retry-After`, expressed as seconds or an HTTP date, can extend either policy,
+even beyond 24 hours. Invalid values are ignored. A shorter new pause never
+reduces an existing later deadline, including one saved by an older version.
+Upgrading therefore does not replace an existing 24-hour pause with a 1-hour wait.
+
+The deadline (`blocked_until`), reason (`cooldown_reason`) and daily-limit strike
+count (`daily_limit_strikes`) are saved in `/data/thermowatt_config.json` in the
+add-on's persistent data. Restarting preserves them and does not bypass the wait.
+Cooldown timing uses the system clock. Keep the app data intact; deleting it
+discards this history and does not reset any vendor-side restriction.
+
+While the deadline is active, the bridge suppresses all its cloud requests:
+login, token refresh, discovery, status polls and heater commands. A limit also
+stops the remaining device requests in the current polling batch and marks all
+known heaters unavailable. MQTT diagnostics continue without cloud traffic.
+Incoming commands are rejected, and the cooldown loop discards queued commands
+and pending command follow-up polls so they are not executed hours later.
+Retained MQTT commands are always ignored.
+
+Expiry permits cloud reads again; it does not unlock heater commands by itself.
+After startup or any bridge pause, **each heater must receive its own newly
+fetched, valid `/status` response** before its commands resume. Authentication,
+discovery, HTTP 200 alone and malformed or unsuccessful status payloads do not
+satisfy this check. Temperature and mode/status fields must pass validation.
+All heater commands are gated, including Off, mode changes and setpoint changes.
+A further pause requires a new valid status again.
+
+The first valid heater status resets the shared daily-limit strike count to zero
+and clears its saved deadline/reason. That heater can accept commands; other
+heaters still awaiting valid status remain blocked. A restart requires fresh
+status for every discovered heater again. This is a validated cloud read, not
+proof that the physical heater is heating or that the backend data is current.
+
+### What Home Assistant users should expect
+
+These waits are **bridge-imposed recovery timing**, not published Thermann backend
+limits or reset times. The request quota, its scope and its reset schedule are
+unknown. The bridge retries automatically when its pause and polling schedule
+allow; the Next Cloud Retry timestamp is not a promise of an immediate request
+or successful recovery. Further limits can extend the wait. Persistent cloud
+failures or rejected status data can leave heaters unavailable and commands
+blocked indefinitely.
+
+The **Thermowatt Bridge** MQTT device exposes Bridge State, Bridge Heartbeat,
+Cooldown Reason and Next Cloud Retry. Heartbeat normally updates every minute
+while the bridge loop runs, including during cooldown; logs report the remaining
+pause and UTC deadline at connection/pause and about every five minutes.
+Home Assistant displays the retry timestamp in its local timezone. Next Cloud
+Retry is unavailable outside an active cooldown. An online bridge or heartbeat
+does not establish heater availability or successful recovery.
+
+Failed responses do not replace retained successful readings with zero or fake
+state, but those retained readings can be stale. Automations should explicitly
+handle unavailable entities and check `last_successful_update`, rather than
+treating old readings or numeric fallbacks as current temperatures. Commands
+rejected during recovery are not replayed; send a new deliberate command after
+that heater has recovered. Cloud acceptance still requires a later status read
+to show the resulting state and does not prove physical heating.
+
+Avoid repeated restarts, tight command-retry automations and multiple bridges.
+Other clients, including the vendor app, may also generate backend traffic; this
+bridge cannot suppress their requests. Increasing `poll_interval` can reduce
+this bridge's traffic, but cannot guarantee recovery or uninterrupted control.
 
 ## Dashboard
 

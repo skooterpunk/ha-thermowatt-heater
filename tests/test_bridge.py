@@ -35,6 +35,8 @@ class BridgeTests(unittest.TestCase):
         self.addCleanup(patch.stopall)
         patch.object(bridge, 'CONFIG_FILE', self.path).start()
         patch.object(bridge.mqtt, 'Client', return_value=MagicMock()).start()
+        # Fail closed: every bridge, including restart fixtures, uses mocked HTTP.
+        patch.object(bridge.requests, 'Session', side_effect=lambda: MagicMock(headers={})).start()
         self.b = bridge.MyThermowattBridge()
         # Synthetic identities for protocol tests; unrelated to any installation.
         self.b.config['devices'] = {'fixture_a': {'name': 'Fixture A', 'last_setpoint': 60},
@@ -49,6 +51,25 @@ class BridgeTests(unittest.TestCase):
     def valid(self):
         return {'success': True, 'result': {'T_Avg': '43.3', 'T_SetPoint': '60',
                                             'Cmd': '9', 'WaterHeaterSts': '1'}}
+
+    def run_at(self, offsets, on_tick=None):
+        """Run finite main-loop iterations against a deterministic wall clock."""
+        ticks = iter(offsets)
+        now = [946684800 + next(ticks)]
+
+        def sleep(_):
+            try:
+                offset = next(ticks)
+            except StopIteration:
+                raise KeyboardInterrupt
+            now[0] = 946684800 + offset
+            if on_tick:
+                on_tick(offset)
+
+        with patch.object(bridge, 'EMAIL', 'test'), patch.object(bridge, 'PASSWORD', 'test'), \
+             patch.object(bridge.time, 'time', side_effect=lambda: now[0]), \
+             patch.object(bridge.time, 'sleep', side_effect=sleep):
+            self.b.run()
 
     def test_log_formatter_uses_utc_with_milliseconds(self):
         record = logging.LogRecord('test', logging.WARNING, '', 0, 'hello', (), None)
@@ -149,7 +170,9 @@ class BridgeTests(unittest.TestCase):
         self.b.session.request.return_value = response({'success': False, 'error': 'Daily request limit exceeded'})
         self.assertFalse(self.b.poll_status('fixture_a'))
         self.assertFalse(self.publications('/STATUS'))
-        self.assertGreater(self.b.config['blocked_until'], bridge.time.time() + 86390)
+        self.assertGreater(self.b.config['blocked_until'], bridge.time.time() + 3590)
+        self.assertLess(self.b.config['blocked_until'], bridge.time.time() + 3610)
+        self.assertEqual(self.b.config['daily_limit_strikes'], 1)
         self.assertFalse(self.b.poll_status('fixture_b'))
         self.assertEqual(self.b.session.request.call_count, 1)
         offline = {c.args[0] for c in self.publications('/availability') if c.args[1] == 'offline'}
@@ -172,6 +195,224 @@ class BridgeTests(unittest.TestCase):
         with self.assertRaises(RuntimeError):
             self.b._validate(response({}, 429, {'Retry-After': date}))
         self.assertGreater(self.b.config['blocked_until'], bridge.time.time() + 7990)
+
+    def test_daily_limit_progression_is_capped_and_counts_survive_restarts(self):
+        now = 946684800
+        for attempt, delay in enumerate((3600, 7200, 14400, 28800, 57600, 86400, 86400), 1):
+            with self.subTest(attempt=attempt), patch.object(bridge.time, 'time', return_value=now):
+                self.b.session.request.return_value = response({
+                    'success': False, 'error': 'Daily request limit exceeded'})
+                self.assertFalse(self.b.poll_status('fixture_a'))
+                self.assertEqual(self.b.config['blocked_until'], now + delay)
+                self.assertEqual(self.b.config['daily_limit_strikes'], min(attempt, 6))
+                self.b = bridge.MyThermowattBridge()
+                self.assertEqual(self.b.config['blocked_until'], now + delay)
+                self.assertEqual(self.b.config['daily_limit_strikes'], min(attempt, 6))
+                with self.assertRaises(RuntimeError):
+                    self.b.request('GET', '/status', serial='fixture_a')
+                self.b.session.request.assert_not_called()
+                now += delay
+
+    def test_new_limits_and_bridge_errors_never_shorten_saved_cooldown(self):
+        with patch.object(bridge.time, 'time', return_value=946684800):
+            deadline = bridge.time.time() + 80000
+            self.b.config.update(blocked_until=deadline, cooldown_reason='saved_longer_cooldown')
+            for body, code, headers in (({'error': 'Daily request limit exceeded'}, 200, {}),
+                                         ({}, 429, {'Retry-After': '7200'})):
+                with self.subTest(code=code), self.assertRaises(RuntimeError):
+                    self.b._validate(response(body, code, headers))
+                self.assertEqual(self.b.config['blocked_until'], deadline)
+                self.assertEqual(self.b.config['cooldown_reason'], 'saved_longer_cooldown')
+            self.b._pause(600)
+            self.assertEqual(self.b.config['blocked_until'], deadline)
+            with self.assertRaises(RuntimeError):
+                self.b._validate(response({}, 429, {'Retry-After': '90000'}))
+            saved = json.loads(Path(self.path).read_text())
+            self.assertEqual(saved['blocked_until'], bridge.time.time() + 90000)
+            self.assertEqual(saved['cooldown_reason'], 'cloud_rate_limit')
+
+    def test_valid_status_resets_persisted_daily_strikes_and_next_delay(self):
+        self.b.config.update(daily_limit_strikes=5, blocked_until=1,
+                             cooldown_reason='daily_request_limit')
+        self.b.session.request.return_value = response(self.valid())
+        self.assertTrue(self.b.poll_status('fixture_a'))
+        saved = json.loads(Path(self.path).read_text())
+        self.assertEqual(saved['daily_limit_strikes'], 0)
+        self.assertEqual(saved['blocked_until'], 0)
+        self.assertEqual(saved['cooldown_reason'], 'none')
+        with patch.object(bridge.time, 'time', return_value=946684800), self.assertRaises(RuntimeError):
+            self.b._validate(response({'error': 'Daily request limit exceeded'}))
+        self.assertEqual(self.b.config['blocked_until'], 946684800 + 3600)
+
+    def test_bad_http_200_status_does_not_reset_persisted_strikes(self):
+        bad = [response(body) for body in (None, [], {}, {'result': {}},
+               dict(self.valid(), success=False), dict(self.valid(), success=0),
+               dict(self.valid(), success='false'), dict(self.valid(), error='Wrong mode'),
+               {'result': dict(self.valid()['result'], T_Avg=None)},
+               {'result': dict(self.valid()['result'], T_SetPoint='nan')},
+               {'result': dict(self.valid()['result'], Cmd=True)},
+               {'result': dict(self.valid()['result'], Cmd=9.5)},
+               {'result': dict(self.valid()['result'], WaterHeaterSts=1.5)})]
+        invalid_json = response({})
+        invalid_json._content = b'not json'
+        for index, reply in enumerate([*bad, invalid_json]):
+            with self.subTest(case=index):
+                self.b.config.update(daily_limit_strikes=3, blocked_until=1,
+                                     cooldown_reason='daily_request_limit')
+                self.b._save_config()
+                self.b.mqtt_client.reset_mock()
+                self.b.session.request.return_value = reply
+                self.assertFalse(self.b.poll_status('fixture_a'))
+                self.assertFalse(self.publications('/STATUS'))
+                saved = json.loads(Path(self.path).read_text())
+                self.assertEqual(saved['daily_limit_strikes'], 3)
+                self.assertEqual(saved['blocked_until'], 1)
+                self.assertEqual(saved['cooldown_reason'], 'daily_request_limit')
+
+    def test_auth_and_discovery_success_do_not_reset_daily_strikes(self):
+        self.b.config.update(daily_limit_strikes=3, blocked_until=1)
+        self.b.session.post.return_value = response({'result': {
+            'accessToken': 'access', 'refreshToken': 'refresh'}})
+        self.b.login()
+        self.assertTrue(self.b.refresh_session())
+        self.b.session.request.return_value = response({'success': True, 'result': {'termostati': []}})
+        self.b.request('GET', '/user-info')
+        self.assertEqual(json.loads(Path(self.path).read_text())['daily_limit_strikes'], 3)
+
+    def test_retry_after_uses_valid_longer_delay_without_poisoning_persistence(self):
+        from email.utils import formatdate
+        now = 946684800
+        cases = [('10', 3600), ('7200', 7200), ('172800', 172800),
+                 (formatdate(now + 8000, usegmt=True), 8000),
+                 (formatdate(now - 8000, usegmt=True), 3600),
+                 ('-1', 3600), ('invalid', 3600), ('NaN', 3600),
+                 ('Infinity', 3600), ('1e300', 3600)]
+        for header, expected in cases:
+            with self.subTest(header=header), patch.object(bridge.time, 'time', return_value=now):
+                self.b.config.update(blocked_until=0, daily_limit_strikes=0)
+                with self.assertRaises(RuntimeError):
+                    self.b._validate(response({'error': 'Daily request limit exceeded'},
+                                              headers={'Retry-After': header}))
+                self.assertEqual(json.loads(Path(self.path).read_text())['blocked_until'], now + expected)
+
+    def test_every_request_path_is_silent_while_blocked(self):
+        self.b.config['blocked_until'] = bridge.time.time() + 3600
+        calls = [lambda: self.b.request('GET', '/status', serial='fixture_a'),
+                 lambda: self.b.request('POST', '/manual', serial='fixture_a'),
+                 self.b.login, self.b.refresh_session,
+                 lambda: self.b._send_request('GET', '/status', serial='fixture_a'),
+                 lambda: self.b._send_request('POST', '/login', auth=True)]
+        for call in calls:
+            with self.subTest(path=call), self.assertRaises(RuntimeError):
+                call()
+        self.b.process_command('fixture_a', 'TEMP', '55')
+        self.assertFalse(self.b.poll_status('fixture_a'))
+        self.b.on_mqtt_message(None, None, SimpleNamespace(
+            topic='P/fixture_a/CMD/MODE', payload=b'Manual', retain=False))
+        self.assertTrue(self.b.commands.empty())
+        self.b.session.request.assert_not_called()
+        self.b.session.post.assert_not_called()
+
+    def test_quota_on_unauthorized_response_prevents_refresh_and_command_replay(self):
+        for code in (200, 401, 429):
+            with self.subTest(code=code):
+                self.b.config.update(blocked_until=0, daily_limit_strikes=0)
+                self.b.session.reset_mock()
+                self.b.session.request.return_value = response({
+                    'success': False, 'error': 'Daily request limit exceeded'}, code)
+                self.b.session.post.return_value = response({'result': {
+                    'accessToken': 'access', 'refreshToken': 'refresh'}})
+                with self.assertRaises(RuntimeError):
+                    self.b.request('GET', '/status', serial='fixture_a')
+                self.assertEqual(self.b.session.request.call_count, 1)
+                self.b.session.post.assert_not_called()
+                self.assertEqual(self.b.config['daily_limit_strikes'], 1)
+
+    def test_refresh_quota_prevents_original_request_replay(self):
+        for method, endpoint in (('GET', '/status'), ('POST', '/manual')):
+            with self.subTest(method=method):
+                self.b.config.update(blocked_until=0, daily_limit_strikes=0)
+                self.b._recovery_pending.clear()
+                self.b.session.reset_mock()
+                self.b.session.request.return_value = response({}, 401)
+                self.b.session.post.return_value = response({'error': 'Daily request limit exceeded'})
+                with self.assertRaises(RuntimeError):
+                    self.b.request(method, endpoint, serial='fixture_a')
+                self.assertEqual(self.b.session.request.call_count, 1)
+                self.assertEqual(self.b.session.post.call_count, 1)
+                self.assertEqual(self.b.config['daily_limit_strikes'], 1)
+
+    def test_daily_limit_reached_without_exceeded_is_still_a_daily_limit(self):
+        with patch.object(bridge.time, 'time', return_value=946684800), self.assertRaises(RuntimeError):
+            self.b._validate(response({'success': False, 'error': 'Daily request limit reached'}))
+        self.assertEqual(self.b.config['blocked_until'], 946684800 + 3600)
+
+    def test_recovery_requires_valid_read_only_status_for_each_heater(self):
+        with patch.object(bridge.time, 'time', return_value=946684800):
+            with self.assertRaises(RuntimeError):
+                self.b._validate(response({'error': 'Daily request limit exceeded'}))
+        with patch.object(bridge.time, 'time', return_value=946684800 + 3600):
+            self.b.session.request.return_value = response({'success': True})
+            self.b.process_command('fixture_a', 'TEMP', '55')
+            self.b.on_mqtt_message(None, None, SimpleNamespace(
+                topic='P/fixture_a/CMD/MODE', payload=b'Manual', retain=False))
+            self.assertTrue(self.b.commands.empty())
+            self.b.session.request.assert_not_called()
+            self.assertFalse(self.b.poll_status('fixture_a'))
+            self.b.process_command('fixture_a', 'MODE', 'Manual')
+            self.assertEqual(self.b.session.request.call_count, 1)
+            self.assertFalse(self.b.pending_commands)
+            self.b.session.request.return_value = response(self.valid())
+            self.assertTrue(self.b.poll_status('fixture_a'))
+            self.b.session.request.reset_mock()
+            # Resetting the global backoff must not unlock another heater.
+            self.b.process_command('fixture_b', 'MODE', 'Manual')
+            self.b.session.request.assert_not_called()
+            self.b.session.request.return_value = response({'success': True})
+            self.b.process_command('fixture_a', 'TEMP', '55')
+            self.assertEqual(self.b.session.request.call_args.args[:2],
+                             ('POST', self.b.BASE_URL + '/manual'))
+            self.assertEqual(self.b.config['devices']['fixture_a']['last_setpoint'], 55)
+
+    def test_recovery_guard_survives_restart_after_partial_status_recovery(self):
+        with patch.object(bridge.time, 'time', return_value=946684800):
+            with self.assertRaises(RuntimeError):
+                self.b._validate(response({}, 429))
+        self.b.session.request.return_value = response(self.valid())
+        self.assertTrue(self.b.poll_status('fixture_a'))
+        self.b = bridge.MyThermowattBridge()
+        self.b.process_command('fixture_b', 'MODE', 'Manual')
+        self.b.session.request.assert_not_called()
+        with self.assertRaises(RuntimeError):
+            self.b.request('POST', '/manual', serial='fixture_b')
+        with self.assertRaises(RuntimeError):
+            self.b._send_request('POST', '/manual', serial='fixture_b')
+
+    def test_all_heater_commands_stay_blocked_until_valid_recovery_status(self):
+        with patch.object(bridge.time, 'time', return_value=946684800):
+            self.b._pause(3600)
+        with patch.object(bridge.time, 'time', return_value=946684800 + 3600):
+            self.b.session.request.return_value = response({'success': True})
+            for command, payload in [('TEMP', '55'), *[('MODE', mode) for mode in
+                                       ('Manual', 'Eco', 'Auto', 'Off', 'Holiday')]]:
+                with self.subTest(command=command, payload=payload):
+                    self.b.process_command('fixture_a', command, payload)
+            with self.assertRaises(RuntimeError):
+                self.b.request('POST', '/manual')
+            self.b.session.request.assert_not_called()
+            self.b.session.post.assert_not_called()
+            self.assertEqual(self.b.config['devices']['fixture_a']['last_setpoint'], 60)
+            self.assertFalse(self.b.pending_commands)
+
+    def test_new_pause_requires_another_valid_read_for_previously_recovered_heater(self):
+        self.b.session.request.return_value = response(self.valid())
+        self.assertTrue(self.b.poll_status('fixture_a'))
+        with patch.object(bridge.time, 'time', return_value=946684800):
+            with self.assertRaises(RuntimeError):
+                self.b._validate(response({}, 429))
+        self.b.session.request.reset_mock()
+        self.b.process_command('fixture_a', 'MODE', 'Manual')
+        self.b.session.request.assert_not_called()
 
     def test_valid_reading_publishes_real_temperatures_and_heating(self):
         self.b.session.request.return_value = response(self.valid())
@@ -465,7 +706,112 @@ class BridgeTests(unittest.TestCase):
         self.assertEqual(self.b.session.request.call_count, 2)
         self.assertFalse(self.publications('/STATUS'))
 
+    def test_main_loop_saved_cooldown_has_no_cloud_io_and_drops_stale_commands(self):
+        self.b.config.update(blocked_until=946684800 + 3600, daily_limit_strikes=2)
+        self.b._save_config()
+        self.b = bridge.MyThermowattBridge()
+        self.b.commands.put(('fixture_a', 'TEMP', '55'))
+        self.b.pending_commands['fixture_a'] = 946684800
+        self.run_at([0, 61, 3599])
+        self.b.session.request.assert_not_called()
+        self.b.session.post.assert_not_called()
+        self.assertTrue(self.b.commands.empty())
+        self.assertFalse(self.b.pending_commands)
+        health = [json.loads(call.args[1]) for call in self.publications('/health')]
+        self.assertEqual(len(health), 3)
+        self.assertTrue(all(item['state'] == 'paused' for item in health))
+        self.assertEqual(self.b.config['daily_limit_strikes'], 2)
+
+    def test_main_loop_reads_before_allowing_commands_after_restart(self):
+        self.b.config.update(blocked_until=1, daily_limit_strikes=3)
+        self.b._save_config()
+        self.b = bridge.MyThermowattBridge()
+        self.b.commands.put(('fixture_a', 'TEMP', '55'))
+        self.b.session.post.return_value = response({'result': {
+            'accessToken': 'access', 'refreshToken': 'refresh'}})
+        self.b.session.request.side_effect = [
+            response({'result': {'termostati': [{'seriale': serial}
+                     for serial in self.b.config['devices']]}}),
+            response(self.valid()), response(self.valid())]
+        self.run_at([0])
+        paths = [(call.args[0], call.args[1].removeprefix(self.b.BASE_URL))
+                 for call in self.b.session.request.call_args_list]
+        self.assertEqual(paths, [('GET', '/user-info'), ('GET', '/status'), ('GET', '/status')])
+        self.b.session.post.assert_called_once()
+        self.assertEqual(self.b.config['daily_limit_strikes'], 0)
+        self.assertFalse(self.b._recovery_pending)
+        self.assertFalse(self.b.pending_commands)
+        self.assertEqual(self.b.config['devices']['fixture_a']['last_setpoint'], 60)
+
+    def test_main_loop_preserves_configured_600_second_polling(self):
+        self.b.POLL_INTERVAL = 600
+        self.b.login = MagicMock()
+        attempts = []
+
+        def cloud(method, url, **kwargs):
+            attempts.append((bridge.time.time() - 946684800, url.removeprefix(self.b.BASE_URL)))
+            if url.endswith('/user-info'):
+                return response({'result': {'termostati': [{'seriale': serial}
+                                for serial in self.b.config['devices']]}})
+            return response(self.valid())
+
+        self.b.session.request.side_effect = cloud
+        self.run_at([0, 1, 599, 600, 601])
+        self.assertEqual(attempts, [(0, '/user-info'), (0, '/status'), (0, '/status'),
+                                    (600, '/status'), (600, '/status')])
+        self.b.login.assert_called_once()
+        self.assertEqual(self.b.POLL_INTERVAL, 600)
+        self.assertEqual(json.loads(self.publications('/health')[-1].args[1])['poll_interval'], 600)
+
+    def test_main_loop_failed_recovery_keeps_600_second_polling_and_rejects_commands(self):
+        self.b.config.update(blocked_until=946684800, daily_limit_strikes=3)
+        self.b.POLL_INTERVAL = 600
+        self.b.login = MagicMock()
+        attempts = []
+
+        def cloud(method, url, **kwargs):
+            attempts.append((bridge.time.time() - 946684800, url.removeprefix(self.b.BASE_URL)))
+            if url.endswith('/user-info'):
+                return response({'result': {'termostati': [{'seriale': serial}
+                                for serial in self.b.config['devices']]}})
+            return response({'success': False})
+
+        def command(_):
+            self.b.on_mqtt_message(None, None, SimpleNamespace(
+                topic='P/fixture_a/CMD/TEMP', payload=b'55', retain=False))
+
+        self.b.session.request.side_effect = cloud
+        self.run_at([0, 1, 599, 600], on_tick=command)
+        self.assertEqual(attempts, [(0, '/user-info'), (0, '/status'), (0, '/status'),
+                                    (600, '/status'), (600, '/status')])
+        self.assertEqual(self.b.config['daily_limit_strikes'], 3)
+        self.assertTrue(self.b.commands.empty())
+        self.assertFalse(self.b.pending_commands)
+        self.b.session.post.assert_not_called()
+
+    def test_main_loop_repeated_quota_recovery_stops_batch_and_backs_off(self):
+        self.b.config.update(blocked_until=946684800, daily_limit_strikes=1)
+        self.b.POLL_INTERVAL = 600
+        self.b.login = MagicMock()
+        attempts = []
+
+        def cloud(method, url, **kwargs):
+            attempts.append((bridge.time.time() - 946684800, url.removeprefix(self.b.BASE_URL)))
+            if url.endswith('/user-info'):
+                return response({'result': {'termostati': [{'seriale': serial}
+                                for serial in self.b.config['devices']]}})
+            return response({'success': False, 'error': 'Daily request limit exceeded'})
+
+        self.b.session.request.side_effect = cloud
+        self.run_at([0, 1, 7199, 7200, 7201])
+        self.assertEqual(attempts, [(0, '/user-info'), (0, '/status'), (7200, '/status')])
+        self.b.login.assert_called_once()
+        self.b.session.post.assert_not_called()
+        self.assertEqual(self.b.config['daily_limit_strikes'], 3)
+        self.assertEqual(self.b.config['blocked_until'], 946684800 + 7200 + 14400)
+        self.assertEqual(self.b.POLL_INTERVAL, 600)
+
 
 if __name__ == '__main__':
-    unittest.fixture_a()
+    unittest.main()
 

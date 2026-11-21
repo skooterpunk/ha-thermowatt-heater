@@ -1,5 +1,12 @@
 # Thermowatt bridge reliability repair
 
+This guide records the original 1.3.1–1.3.3 repair. Its fixed 24-hour daily-limit
+policy, fork URLs and release-specific installation steps are historical. For
+this fork's current installation and implemented 1.3.7 behaviour, including
+progressive cooldown and per-heater command recovery, use the
+[README](README.md#rate-limit-recovery-v137). The backup, validation and rollback
+guidance below remains useful.
+
 ## Version 1.3.3: visible cooldown status
 
 The **Thermowatt Bridge** MQTT device exposes Bridge State, Bridge Heartbeat,
