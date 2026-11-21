@@ -1,3 +1,11 @@
+## 1.3.7
+
+- Retry daily limits after 1, 2, 4, 8, 16 and then 24 hours; honor longer Retry-After delays.
+- Preserve cooldown deadlines and daily-limit strikes across restarts; reset strikes only on valid status.
+- Suppress cloud requests during cooldown, including authentication; handle quota errors before token refresh.
+- Require fresh status for each heater before commands resume, preserving the configured polling interval.
+- Reject malformed success responses and invalid Retry-After deadlines without clearing recovery backoff.
+
 # Changelog
 
 ## 1.3.6
